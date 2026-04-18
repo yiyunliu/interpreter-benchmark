@@ -58,13 +58,50 @@
                      (denote env thn))))]
     [else e]))
 
+
+
+
+
 (: denote-fast (-> Expr (-> Env Value)))
 (define (denote-fast e)
   (cond
     [(Var? e) (lambda ([env : Env])
-                (hash-ref (Var-val e)))]
-    []))
-
+                (hash-ref env (Var-val e)))]
+    [(App? e) (let ([fun-clos (denote-fast (App-fun e))]
+                    [arg-closs (for/list : (Listof (-> Env Value)) ([arg (App-args e)])
+                                 (denote-fast arg))])
+                (lambda ([env : Env])
+                  (ap (fun-clos env)
+                      (for/list ([arg-clos arg-closs])
+                        (arg-clos env)))))]
+    [(Fix? e) (let ([params (Fix-params e)]
+                    [body-clos (denote-fast (Fix-body e))])
+                (lambda ([env : Env])
+                  (: self Closure)
+                  (define self
+                    (lambda ([vals : (Listof Value)])
+                      (let ([env (for/fold ([env : Env env])
+                                           ([param params]
+                                            [val (cons self vals)])
+                                   (hash-set env param val))])
+                        (body-clos env))))
+                  self))]
+    [(Prim? e)
+     (let ([op (Prim-op e)]
+           [lhs-clos (denote-fast (Prim-lhs e))]
+           [rhs-clos (denote-fast (Prim-rhs e))])
+       (lambda ([env : Env])
+         (denote-op op (lhs-clos env) (rhs-clos env))))]
+    [(If? e)
+     (let ([guard-clos (denote-fast (If-guard e))]
+           [thn-clos (denote-fast (If-thn e))]
+           [els-clos (denote-fast (If-els e))])
+       (lambda ([env : Env])
+         (let ([guard (guard-clos env)])
+           (if (and (number? guard) (zero? guard))
+               (els-clos env)
+               (thn-clos env)))))]
+    [e (lambda ([env : Env]) e)]))
 
 
 (: fib-expr Expr)
@@ -86,6 +123,10 @@
 
 (module+ main
   (println "-----------------native---------------")
-  (println (time (fib 30)))
+  (println (time (cons (fib 30) (fib 30))))
   (println "------------interpreted---------------")
-  (println (time (denote (hash) (App fib-expr '(30))))))
+  (println (time (cons (denote (hash) (App fib-expr '(30)))
+                       (denote (hash) (App fib-expr '(30))))))
+  (println "----------------closure---------------")
+  (println (let ([compiled (denote-fast (App fib-expr '(30)))])
+             (time (cons (compiled (hash)) (compiled (hash)))))))
