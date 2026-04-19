@@ -22,16 +22,20 @@
     [else
      (error "trying to apply a non-function")]))
 
-(: denote-op (-> Binop Value Value Real))
-(define (denote-op op lhs rhs)
-  (cond [(and (number? lhs) (number? rhs))
-         (case op
-           ['+ (+ lhs rhs)]
-           ['- (- lhs rhs)]
-           ['* (* lhs rhs)]
-           ['/ (/ lhs rhs)]
-           ['<= (if (<= lhs rhs) 1 0)])]
-        [else (error "trying to apply binary arithmetic on non-numbers")]))
+(: denote-op (-> Binop (-> Value Value Real)))
+(define (denote-op op)
+  (define resolved-op
+    (case op
+      ['+ +]
+      ['- -]
+      ['* *]
+      ['/ /]
+      ['<= (lambda ([lhs : Real] [rhs : Real])
+             (if (<= lhs rhs) 1 0))]))
+  (lambda (lhs rhs)
+    (cond [(and (number? lhs) (number? rhs))
+           (resolved-op lhs rhs)]
+          [else (error "trying to apply binary arithmetic on non-numbers")])))
 
 (: denote (-> Env Expr Value))
 (define (denote env e)
@@ -50,7 +54,7 @@
                       (denote env body))))
                 self)]
     [(Prim? e) (let ([op (Prim-op e)] [lhs (Prim-lhs e)] [rhs (Prim-rhs e)])
-                 (denote-op op (denote env lhs) (denote env rhs)))]
+                 ((denote-op op) (denote env lhs) (denote env rhs)))]
     [(If? e) (let ([guard (If-guard e)] [thn (If-thn e)] [els (If-els e)])
                (let ([guard (denote env guard)])
                  (if (and (number? guard) (zero? guard))
@@ -89,7 +93,7 @@
            [lhs-clos (denote-fast (Prim-lhs e))]
            [rhs-clos (denote-fast (Prim-rhs e))])
        (lambda ([env : Env])
-         (denote-op op (lhs-clos env) (rhs-clos env))))]
+         ((denote-op op) (lhs-clos env) (rhs-clos env))))]
     [(If? e)
      (let ([guard-clos (denote-fast (If-guard e))]
            [thn-clos (denote-fast (If-thn e))]
@@ -180,10 +184,52 @@
 (: dap (-> DValue (Listof DValue) DValue))
 (define (dap fun args)
   (cond
-    [(not (number? fun))
+    [(procedure? fun)
      (fun args)]
     [else
      (error "trying to apply a non-function")]))
+
+
+(: collect-free (-> (Setof Symbol) Expr (Setof Symbol)))
+(define (collect-free bounded e)
+  (: collected (Setof Symbol))
+  (define collected (set))
+  (let go! : Void
+      ([bounded : (Setof Symbol) bounded]
+       [e : Expr e])
+    (cond
+      [(Var? e)
+       (define s (Var-val e))
+       (when (not (set-member? bounded s))
+         (set! collected (set-add collected s)))]
+      [(App? e)
+       (go! bounded (App-fun e))
+       (for ([arg (App-args e)])
+         (go! bounded arg))]
+      [(Fix? e)
+       (go! (set-union bounded (list->set (Fix-params e)))
+            (Fix-body e))]
+      [(Prim? e)
+       (go! bounded (Prim-lhs e))
+       (go! bounded (Prim-rhs e))]
+      [(If? e)
+       (go! bounded (If-guard e))
+       (go! bounded (If-thn e))
+       (go! bounded (If-els e))]
+      [(real? e)
+       (void)]
+      ;; making sure the branches are fully covered
+      [else 1]))
+  collected)
+
+(: collect-captured (-> CEnv Expr (Listof (Pairof Symbol Natural))))
+(define (collect-captured cenv e)
+  (define free-vars (collect-free (set) e))
+  ((inst sort (Pairof Symbol Natural) Natural)
+   (for/list : (Listof (Pairof Symbol Natural)) ([var free-vars])
+     (cons var (cenv var)))
+   >
+   #:key cdr))
 
 ;; Curried version of denote, faster with stack
 
@@ -225,11 +271,11 @@
                       retval))
                   self))]
     [(Prim? e)
-     (let ([op (Prim-op e)]
+     (let ([op (denote-op (Prim-op e))]
            [lhs-clos (denote-faster cenv (Prim-lhs e))]
            [rhs-clos (denote-faster cenv (Prim-rhs e))])
        (lambda ([stack : Stack])
-         (denote-op op (lhs-clos stack) (rhs-clos stack))))]
+         (op (lhs-clos stack) (rhs-clos stack))))]
     [(If? e)
      (let ([guard-clos (denote-faster cenv (If-guard e))]
            [thn-clos (denote-faster cenv (If-thn e))]
@@ -241,10 +287,6 @@
                (thn-clos stack)))))]
     [e (lambda ([_ : Stack]) e)]))
 
-
-(define (bench-debruijn)
-  (let ([compiled (denote-faster cenv-empty (App fib-expr '(30)))])
-    (compiled (make-stack 4096))))
 
 (module+ main
 
