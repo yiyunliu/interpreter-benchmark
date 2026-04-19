@@ -11,9 +11,10 @@ type Expr =
     | Prim of Binop * Expr * Expr
     | If of Expr * Expr * Expr
 
+[<Struct>]
 type Value =
     | VInt of int
-    | VClosure of (Value list -> Value)
+    | VClosure of closure: (Value list -> Value)
 
 type Stack = {
     Data: Value []
@@ -23,15 +24,15 @@ type Stack = {
 let makeStack size : Stack =
     { Data = Array.create size (VInt 0); Top = 0 }
 
-let stackPush (stack: Stack) (v: Value) : unit =
+let inline stackPush (stack: Stack) (v: Value) : unit =
     if stack.Top >= stack.Data.Length then failwith "stack overflow!"
     stack.Data.[stack.Top] <- v
     stack.Top <- stack.Top + 1
 
-let stackRef (stack: Stack) (idx: int) : Value =
+let inline stackRef (stack: Stack) (idx: int) : Value =
     stack.Data.[stack.Top - idx - 1]
 
-let stackPop (stack: Stack) : unit =
+let inline stackPop (stack: Stack) : unit =
     stack.Top <- stack.Top - 1
 
 let applyBinop (op: Binop) (lhs: int) (rhs: int) : int =
@@ -95,7 +96,10 @@ let rec denoteFaster (cenv: CEnv) (e: Expr) : Stack -> Value =
         let argCloss = List.map (denoteFaster cenv) args
         fun (stack: Stack) ->
             match funClos stack with
-            | VClosure fn -> fn (List.map (fun c -> c stack) argCloss)
+            | VClosure fn ->
+                match argCloss with
+                | [c] -> fn [c stack]
+                | _ -> fn (List.map (fun c -> c stack) argCloss)
             | _ -> failwith "trying to apply a non-function"
     | Fix (selfName, paramNames, body) ->
         let captured = collectCaptured cenv e
@@ -106,11 +110,13 @@ let rec denoteFaster (cenv: CEnv) (e: Expr) : Stack -> Value =
         let len = List.length allParamNames + List.length capturedDvars
         fun (stack: Stack) ->
             let capturedArgs = capturedDvars |> List.map (stackRef stack) |> List.toArray
+            let nParams = List.length paramNames
             let rec self (vals: Value list) =
                 Array.iter (stackPush stack) capturedArgs
-                List.iter (stackPush stack) (VClosure self :: vals)
+                stackPush stack (VClosure self)
+                List.iter (stackPush stack) vals
                 let retval = bodyClos stack
-                for _ = 1 to len do stackPop stack
+                stack.Top <- stack.Top - len
                 retval
             VClosure self
     | Prim (op, lhs, rhs) ->
