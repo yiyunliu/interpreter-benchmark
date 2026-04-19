@@ -129,23 +129,68 @@ let rec denoteFaster (cenv: CEnv) (e: Expr) : Stack -> Value =
             | VInt v when v = 0 -> elsClos stack
             | _ -> thnClos stack
 
-let fib n =
-    let fibExpr =
-        Fix ("self", ["x"],
-            If (Prim (Le, Var "x", EInt 1),
-                EInt 1,
-                Prim (Add,
-                    App (Var "self", [Prim (Sub, Var "x", EInt 1)]),
-                    App (Var "self", [Prim (Sub, Var "x", EInt 2)]))))
+type Env = Map<string, Value>
+
+let rec denote (env: Env) (e: Expr) : Value =
+    match e with
+    | EInt n -> VInt n
+    | Var s ->
+        match Map.tryFind s env with
+        | Some v -> v
+        | None -> failwith "unbound variable"
+    | App (f, args) ->
+        match denote env f with
+        | VClosure fn -> fn (List.map (denote env) args)
+        | _ -> failwith "trying to apply a non-function"
+    | Fix (selfName, paramNames, body) ->
+        let allParams = selfName :: paramNames
+        let rec self (vals: Value list) =
+            let env' =
+                List.fold2
+                    (fun acc p v -> Map.add p v acc)
+                    env allParams (VClosure self :: vals)
+            denote env' body
+        VClosure self
+    | Prim (op, lhs, rhs) ->
+        match denote env lhs, denote env rhs with
+        | VInt l, VInt r -> VInt (applyBinop op l r)
+        | _ -> failwith "trying to apply binary arithmetic on non-numbers"
+    | If (g, t, el) ->
+        match denote env g with
+        | VInt v when v = 0 -> denote env el
+        | _ -> denote env t
+
+let fibExpr =
+    Fix ("self", ["x"],
+        If (Prim (Le, Var "x", EInt 1),
+            EInt 1,
+            Prim (Add,
+                App (Var "self", [Prim (Sub, Var "x", EInt 1)]),
+                App (Var "self", [Prim (Sub, Var "x", EInt 2)]))))
+
+let runNaive n =
+    match denote Map.empty (App (fibExpr, [EInt n])) with
+    | VInt r -> printfn "%d" r
+    | VClosure _ -> printfn "<closure>"
+
+let runFast n =
     let compiled = denoteFaster cenvEmpty (App (fibExpr, [EInt n]))
     let stack = makeStack 1024
     match compiled stack with
     | VInt r -> printfn "%d" r
     | VClosure _ -> printfn "<closure>"
 
+let rec hostFib n =
+    if n <= 1 then 1
+    else hostFib (n - 1) + hostFib (n - 2)
+
+let runHost n = printfn "%d" (hostFib n)
+
 [<EntryPoint>]
 let main argv =
     match argv with
-    | [| s |] -> fib (int s)
-    | _ -> printfn "Usage: Interpreter <n>"
+    | [| "--naive"; n |] -> runNaive (int n)
+    | [| "--host"; n |] -> runHost (int n)
+    | [| n |] -> runFast (int n)
+    | _ -> printfn "Usage: Interpreter [--naive|--host] <n>"
     0
