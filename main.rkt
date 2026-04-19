@@ -1,16 +1,16 @@
 #lang typed/racket
 
-(define-type Expr (U Real App Var Fix Prim If))
+(define-type Expr (U Integer App Var Fix Prim If))
 
-(define-struct Var ([val : Symbol]))
-(define-struct App ([fun : Expr] [args : (Listof Expr)]))
-(define-struct Fix ([params : (Pairof Symbol (Listof Symbol))] [body : Expr]))
-(define-struct Prim ([op : Binop] [lhs : Expr] [rhs : Expr]))
-(define-struct If ([guard : Expr] [thn : Expr] [els : Expr]))
+(define-struct Var ([val : Symbol]) #:transparent)
+(define-struct App ([fun : Expr] [args : (Listof Expr)]) #:transparent)
+(define-struct Fix ([params : (Pairof Symbol (Listof Symbol))] [body : Expr]) #:transparent)
+(define-struct Prim ([op : Binop] [lhs : Expr] [rhs : Expr]) #:transparent)
+(define-struct If ([guard : Expr] [thn : Expr] [els : Expr]) #:transparent)
 
-(define-type Binop (U '+ '- '* '/ '<=))
+(define-type Binop (U '+ '- '* 'quotient '<=))
 
-(define-type Value (U Real Closure))
+(define-type Value (U Integer Closure))
 (define-type Env (Immutable-HashTable Symbol Value))
 (define-type Closure (-> (Listof Value) Value))
 
@@ -22,15 +22,15 @@
     [else
      (error "trying to apply a non-function")]))
 
-(: denote-op (-> Binop (-> Value Value Real)))
+(: denote-op (-> Binop (-> Value Value Integer)))
 (define (denote-op op)
   (define resolved-op
     (case op
       ['+ +]
       ['- -]
       ['* *]
-      ['/ /]
-      ['<= (lambda ([lhs : Real] [rhs : Real])
+      ['quotient quotient]
+      ['<= (lambda ([lhs : Integer] [rhs : Integer])
              (if (<= lhs rhs) 1 0))]))
   (lambda (lhs rhs)
     (cond [(and (number? lhs) (number? rhs))
@@ -105,24 +105,6 @@
                (thn-clos env)))))]
     [e (lambda ([env : Env]) e)]))
 
-
-(: fib-expr Expr)
-(define fib-expr
-  (Fix '(self x)
-       (If (Prim '<= (Var 'x) 1)
-           1
-           (Prim '+
-                 (App (Var 'self) (list (Prim '- (Var 'x) 1)))
-                 (App (Var 'self) (list (Prim '- (Var 'x) 2)))))))
-
-(: fib (-> Real Real))
-(define (fib n)
-  (if (<= n 1)
-      1
-      (+ (fib (- n 1))
-         (fib (- n 2)))))
-
-
 (define-type CEnv (-> Symbol Natural))
 
 (: cenv-empty CEnv)
@@ -178,7 +160,7 @@
     (set-box! btop (sub1 top))))
 
 
-(define-type DValue (U Real DClosure))
+(define-type DValue (U Integer DClosure))
 (define-type DClosure (-> (Listof DValue) DValue))
 
 (: dap (-> DValue (Listof DValue) DValue))
@@ -201,6 +183,7 @@
       [(Var? e)
        (define s (Var-val e))
        (when (not (set-member? bounded s))
+         ;; (println (format "adding ~a to set ~a" s collected))
          (set! collected (set-add collected s)))]
       [(App? e)
        (go! bounded (App-fun e))
@@ -224,6 +207,7 @@
 
 (: collect-captured (-> CEnv Expr (Listof (Pairof Symbol Natural))))
 (define (collect-captured cenv e)
+  ;; (println (format "collecting captured for ~a" e))
   (define free-vars (collect-free (set) e))
   ((inst sort (Pairof Symbol Natural) Natural)
    (for/list : (Listof (Pairof Symbol Natural)) ([var free-vars])
@@ -231,13 +215,10 @@
    >
    #:key cdr))
 
-;; Curried version of denote, faster with stack
+;; Curried version of denote. Runs even faster because it uses an
+;; imperative stack as its environment, but requires closure conversion
+;; since the imperative stack is not persistent and expensive to copy
 
-;; Note that this version is wrong because it doesn't handle
-;; closures properly unless you perform a deep copy of the stack
-;; every time you evaluate Fix.
-;; Would closure conversion be necessary ;; for the imperative stack
-;; to work?
 (: denote-faster (-> CEnv Expr (-> Stack Value)))
 (define (denote-faster cenv e)
   (cond
@@ -255,14 +236,23 @@
                       (for/list ([arg-clos arg-closs])
                         (arg-clos stack)))))]
     [(Fix? e) (let* ([params (Fix-params e)]
+                     [body (Fix-body e)]
+                     [captured (collect-captured cenv e)]
+                     [captured-vars (for/list : (Listof Symbol) ([sd captured]) (car sd))]
+                     [captured-dvars (for/list : (Listof Natural) ([sd captured]) (cdr sd))]
                      [body-clos (denote-faster
-                                 (cenv-extend-mult cenv params)
-                                 (Fix-body e))]
-                     [len (length params)])
+                                 (cenv-extend-mult cenv (append captured-vars params))
+                                 body)]
+                     [len (+ (length params) (length captured-dvars))])
                 (lambda ([stack : Stack])
+                  (define captured-args
+                    (for/vector : (Vectorof DValue) ([dvar captured-dvars])
+                      (stack-ref stack dvar)))
                   (: self DClosure)
                   (define self
                     (lambda ([vals : (Listof DValue)])
+                      (for ([val captured-args])
+                        (stack-push! stack val))
                       (for ([val (cons self vals)])
                         (stack-push! stack val))
                       (define retval (body-clos stack))
@@ -289,17 +279,36 @@
 
 
 (module+ main
+  (: fib-expr Expr)
+  (define fib-expr
+    (Fix '(self x)
+         (If (Prim '<= (Var 'x) 1)
+             1
+             (Prim '+
+                   (App (Var 'self) (list (Prim '- (Var 'x) 1)))
+                   (App (Var 'self) (list (Prim '- (Var 'x) 2)))))))
+
+  (: fib (-> Integer Integer))
+  (define (fib n)
+    (if (<= n 1)
+        1
+        (+ (fib (- n 1))
+           (fib (- n 2)))))
+
+  (: closure Expr)
+  (define closure
+    (Fix '(self x)
+         (Fix '(self y)
+              (Prim '+ (Var 'x) (Var 'y)))))
 
   (println "-----------------native---------------")
-  (println (time (fib 35)))
+  (println (time (fib 30)))
   (println "------------interpreted---------------")
-  (println (time (denote (hash) (App fib-expr '(35)))))
+  (println (time (denote (hash) (App fib-expr '(30)))))
   (println "----------------closure---------------")
-  (println (let ([compiled (denote-fast (App fib-expr '(35)))])
+  (println (let ([compiled (denote-fast (App fib-expr '(30)))])
              (time (compiled (hash)))))
   (println "----------------debruijn--------------")
-  (println (let ([compiled (denote-faster cenv-empty (App fib-expr '(35)))]
+  (println (time (let ([compiled (denote-faster cenv-empty (App fib-expr '(30)))]
                  [stack (make-stack 1024)])
-             (time (compiled stack)))))
-
-(provide (all-defined-out))
+                   (compiled stack)))))
