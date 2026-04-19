@@ -59,9 +59,7 @@
     [else e]))
 
 
-
-
-
+;; Curried version of denote
 (: denote-fast (-> Expr (-> Env Value)))
 (define (denote-fast e)
   (cond
@@ -121,12 +119,145 @@
          (fib (- n 2)))))
 
 
+(define-type CEnv (-> Symbol Natural))
+
+(: cenv-empty CEnv)
+(define (cenv-empty s)
+  (error (format "unmapped symbol ~a" s)))
+
+(: cenv-extend (-> CEnv Symbol CEnv))
+(define (cenv-extend cenv s-new)
+  (lambda ([s : Symbol])
+    (if (symbol=? s s-new)
+        0
+        (add1 (cenv s)))))
+
+(: cenv-extend-mult (-> CEnv (Listof Symbol) CEnv))
+(define (cenv-extend-mult cenv params)
+  (for/fold
+      ([cenv cenv])
+      ([param params])
+    (cenv-extend cenv param)))
+
+(define-struct Stack
+  ([data : (Mutable-Vectorof (U Value #f))]
+   [top : (Boxof Integer)]))
+
+(: make-stack (-> Integer Stack))
+(define (make-stack size)
+  (Stack (make-vector size #f) (box 0)))
+
+(: stack-push! (-> Stack Value Void))
+(define (stack-push! stack val)
+  (let* ([data (Stack-data stack)]
+         [btop (Stack-top stack)]
+         [top (unbox btop)]
+         [size (vector-length data)])
+    (cond
+      [(>= top size)
+       (error "stack overflow!")]
+      [else
+       (vector-set! data top val)
+       (set-box! btop (add1 top))])))
+
+(: stack-ref (-> Stack Integer Value))
+(define (stack-ref stack idx)
+  (or (vector-ref (Stack-data stack) (- (unbox (Stack-top stack)) idx 1))
+      (error "broken invariant in stack")))
+
+(: stack-pop! (-> Stack Void))
+(define (stack-pop! stack)
+  (let* ([btop (Stack-top stack)]
+         [top (unbox btop)]
+         [data (Stack-data stack)])
+    (vector-set! data top #f)
+    (set-box! btop (sub1 top))))
+
+
+(define-type DValue (U Real DClosure))
+(define-type DClosure (-> (Listof DValue) DValue))
+
+(: dap (-> DValue (Listof DValue) DValue))
+(define (dap fun args)
+  (cond
+    [(not (number? fun))
+     (fun args)]
+    [else
+     (error "trying to apply a non-function")]))
+
+;; Curried version of denote, faster with stack
+
+;; Note that this version is wrong because it doesn't handle
+;; closures properly unless you perform a deep copy of the stack
+;; every time you evaluate Fix.
+;; Would closure conversion be necessary ;; for the imperative stack
+;; to work?
+(: denote-faster (-> CEnv Expr (-> Stack Value)))
+(define (denote-faster cenv e)
+  (cond
+    [(Var? e)
+     (let* ([var (Var-val e)]
+            [dvar (cenv var)])
+       (lambda ([stack : Stack])
+         (stack-ref stack dvar)))]
+    [(App? e) (let ([fun-clos (denote-faster cenv (App-fun e))]
+                    [arg-closs (for/list : (Listof (-> Stack Value))
+                                         ([arg (App-args e)])
+                                 (denote-faster cenv arg))])
+                (lambda ([stack : Stack])
+                  (dap (fun-clos stack)
+                      (for/list ([arg-clos arg-closs])
+                        (arg-clos stack)))))]
+    [(Fix? e) (let* ([params (Fix-params e)]
+                     [body-clos (denote-faster
+                                 (cenv-extend-mult cenv params)
+                                 (Fix-body e))]
+                     [len (length params)])
+                (lambda ([stack : Stack])
+                  (: self DClosure)
+                  (define self
+                    (lambda ([vals : (Listof DValue)])
+                      (for ([val (cons self vals)])
+                        (stack-push! stack val))
+                      (define retval (body-clos stack))
+                      (for ([_ (in-range len)])
+                        (stack-pop! stack))
+                      retval))
+                  self))]
+    [(Prim? e)
+     (let ([op (Prim-op e)]
+           [lhs-clos (denote-faster cenv (Prim-lhs e))]
+           [rhs-clos (denote-faster cenv (Prim-rhs e))])
+       (lambda ([stack : Stack])
+         (denote-op op (lhs-clos stack) (rhs-clos stack))))]
+    [(If? e)
+     (let ([guard-clos (denote-faster cenv (If-guard e))]
+           [thn-clos (denote-faster cenv (If-thn e))]
+           [els-clos (denote-faster cenv (If-els e))])
+       (lambda ([stack : Stack])
+         (let ([guard (guard-clos stack)])
+           (if (and (number? guard) (zero? guard))
+               (els-clos stack)
+               (thn-clos stack)))))]
+    [e (lambda ([_ : Stack]) e)]))
+
+
+(define (bench-debruijn)
+  (let ([compiled (denote-faster cenv-empty (App fib-expr '(30)))])
+    (compiled (make-stack 4096))))
+
 (module+ main
+
   (println "-----------------native---------------")
-  (println (time (cons (fib 30) (fib 30))))
+  (println (time (fib 35)))
   (println "------------interpreted---------------")
-  (println (time (cons (denote (hash) (App fib-expr '(30)))
-                       (denote (hash) (App fib-expr '(30))))))
+  (println (time (denote (hash) (App fib-expr '(35)))))
   (println "----------------closure---------------")
-  (println (let ([compiled (denote-fast (App fib-expr '(30)))])
-             (time (cons (compiled (hash)) (compiled (hash)))))))
+  (println (let ([compiled (denote-fast (App fib-expr '(35)))])
+             (time (compiled (hash)))))
+  (println "----------------debruijn--------------")
+  (println (let ([compiled (denote-faster cenv-empty (App fib-expr '(35)))]
+                 [stack (make-stack 1024)])
+             (time (compiled stack)))))
+
+(provide (all-defined-out))
