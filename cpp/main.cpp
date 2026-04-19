@@ -2,7 +2,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
-#include <gc/gc.h>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -40,12 +39,10 @@ struct Prim { Binop op; Expr lhs; Expr rhs; };
 struct If { Expr guard; Expr thn; Expr els; };
 
 struct Closure;
-using Value = std::variant<int, Closure*>;
+using Value = std::variant<int, std::shared_ptr<Closure>>;
 
 struct Closure {
     std::function<Value(std::vector<Value>)> fn;
-    void* operator new(size_t size) { return GC_MALLOC(size); }
-    void operator delete(void*) {}
 };
 
 int apply_binop(Binop op, int lhs, int rhs) {
@@ -88,7 +85,7 @@ Value denote(const Env& env, const Expr& e) {
         },
         [&](const std::unique_ptr<App>& a) -> Value {
             auto fn_val = denote(env, a->fn);
-            auto* cl = std::get_if<Closure*>(&fn_val);
+            auto* cl = std::get_if<std::shared_ptr<Closure>>(&fn_val);
             if (!cl) throw std::runtime_error("apply non-function");
             std::vector<Value> args;
             args.reserve(a->args.size());
@@ -96,7 +93,7 @@ Value denote(const Env& env, const Expr& e) {
             return (*cl)->fn(std::move(args));
         },
         [&](const std::unique_ptr<Fix>& f) -> Value {
-            auto closure = new Closure();
+            auto closure = std::make_shared<Closure>();
             auto self = closure;
             std::vector<std::string> all_params;
             all_params.push_back(f->self_name);
@@ -105,7 +102,7 @@ Value denote(const Env& env, const Expr& e) {
             Env env_copy = env;
             closure->fn = [self, env_copy, all_params, body](std::vector<Value> vals) -> Value {
                 Env new_env = env_copy;
-                new_env[all_params[0]] = self;
+                new_env[all_params[0]] = Value{self};
                 for (size_t i = 0; i < vals.size(); i++)
                     new_env[all_params[i + 1]] = std::move(vals[i]);
                 return denote(new_env, *body);
@@ -227,7 +224,7 @@ Compiled denote_faster(CEnv cenv, const Expr& e) {
             for (const auto& arg : a->args) arg_closs.push_back(denote_faster(cenv, arg));
             return [fun_clos, arg_closs](Stack& stk) -> Value {
                 auto fn_val = fun_clos(stk);
-                auto* cl = std::get_if<Closure*>(&fn_val);
+                auto* cl = std::get_if<std::shared_ptr<Closure>>(&fn_val);
                 if (!cl) throw std::runtime_error("apply non-function");
                 std::vector<Value> args;
                 args.reserve(arg_closs.size());
@@ -251,17 +248,17 @@ Compiled denote_faster(CEnv cenv, const Expr& e) {
                 std::vector<Value> captured_args;
                 captured_args.reserve(captured_dvars.size());
                 for (int d : captured_dvars) captured_args.push_back(stk.ref(d));
-                auto closure = new Closure();
+                auto closure = std::make_shared<Closure>();
                 closure->fn = [closure, captured_args, body_clos, &stk, len](
                                   std::vector<Value> vals) -> Value {
                     for (const auto& val : captured_args) stk.push(val);
-                    stk.push(closure);
+                    stk.push(Value{closure});
                     for (auto& val : vals) stk.push(std::move(val));
                     auto retval = body_clos(stk);
                     stk.pop(len);
                     return retval;
                 };
-                return closure;
+                return Value{closure};
             };
         },
         [&](const std::unique_ptr<Prim>& p) -> Compiled {
@@ -315,7 +312,6 @@ Expr make_fib_expr() {
 }
 
 int main(int argc, char* argv[]) {
-    GC_INIT();
     if (argc < 2) {
         printf("Usage: interpreter [--naive|--host] <n>\n");
         return 1;
