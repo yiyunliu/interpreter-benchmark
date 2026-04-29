@@ -381,6 +381,7 @@ struct FFixClosure {
     FValue* captured_args;
     int ncaptured;
     const FInstr* body;
+    int body_idx;
     int frame_len;
 };
 
@@ -455,6 +456,7 @@ FValue eval_fastest(const FInstr* instr, FStack& stk) {
             for (int i = 0; i < instr->ncaptured; i++)
                 closure->captured_args[i] = stk.ref(instr->captured_dvars[i]);
             closure->body = instr->body_instr;
+            closure->body_idx = 0;
             closure->frame_len = instr->frame_len;
             return fv_closure(closure);
         }
@@ -533,6 +535,115 @@ const FInstr* denote_fastest(CEnv cenv, const Expr& e) {
     }, e);
 }
 
+struct VIntInstr { int val; };
+struct VVarInstr { int dvar; };
+struct VPrimInstr { Binop op; int lhs; int rhs; };
+struct VAppInstr { int fn; int* args; int nargs; };
+struct VFixInstr { int body; int* captured_dvars; int ncaptured; int frame_len; };
+struct VIfInstr { int guard; int thn; int els; };
+
+using VInstr = std::variant<VIntInstr, VVarInstr, VPrimInstr, VAppInstr, VFixInstr, VIfInstr>;
+
+struct VProgram {
+    std::vector<VInstr> instrs;
+    int emit(const VInstr& i) { int idx = instrs.size(); instrs.push_back(i); return idx; }
+    const VInstr& at(int i) const { return instrs[i]; }
+};
+
+FValue eval_variant(const VProgram& prog, int pc, FStack& stk) {
+    return std::visit(overloaded{
+        [&](const VIntInstr& i) -> FValue { return fv_int(i.val); },
+        [&](const VVarInstr& i) -> FValue { return stk.ref(i.dvar); },
+        [&](const VPrimInstr& i) -> FValue {
+            auto l = eval_variant(prog, i.lhs, stk);
+            auto r = eval_variant(prog, i.rhs, stk);
+            return fv_int(apply_binop(i.op, l.int_val, r.int_val));
+        },
+        [&](const VAppInstr& i) -> FValue {
+            auto fn_val = eval_variant(prog, i.fn, stk);
+            if (fn_val.tag != FValue::Closure) throw std::runtime_error("apply non-function");
+            auto& closure = *fn_val.closure_val;
+            FValue arg_buf[8];
+            FValue* args = i.nargs <= 8 ? arg_buf : new FValue[i.nargs];
+            for (int j = 0; j < i.nargs; j++)
+                args[j] = eval_variant(prog, i.args[j], stk);
+            for (int j = 0; j < closure.ncaptured; j++)
+                stk.push(closure.captured_args[j]);
+            stk.push(fv_closure(fn_val.closure_val));
+            for (int j = 0; j < i.nargs; j++)
+                stk.push(args[j]);
+            if (i.nargs > 8) delete[] args;
+            auto retval = eval_variant(prog, closure.body_idx, stk);
+            stk.pop(closure.frame_len);
+            return retval;
+        },
+        [&](const VFixInstr& i) -> FValue {
+            auto* closure = new FFixClosure();
+            closure->ncaptured = i.ncaptured;
+            closure->captured_args = i.ncaptured > 0 ? new FValue[i.ncaptured] : nullptr;
+            for (int j = 0; j < i.ncaptured; j++)
+                closure->captured_args[j] = stk.ref(i.captured_dvars[j]);
+            closure->body = nullptr;
+            closure->body_idx = i.body;
+            closure->frame_len = i.frame_len;
+            return fv_closure(closure);
+        },
+        [&](const VIfInstr& i) -> FValue {
+            auto g = eval_variant(prog, i.guard, stk);
+            if (g.int_val == 0)
+                return eval_variant(prog, i.els, stk);
+            return eval_variant(prog, i.thn, stk);
+        }
+    }, prog.at(pc));
+}
+
+int denote_variant(CEnv cenv, const Expr& e, VProgram& prog) {
+    return std::visit(overloaded{
+        [&](int n) -> int {
+            return prog.emit(VIntInstr{n});
+        },
+        [&](const std::unique_ptr<Var>& v) -> int {
+            return prog.emit(VVarInstr{cenv(v->name)});
+        },
+        [&](const std::unique_ptr<App>& a) -> int {
+            int fn_idx = denote_variant(cenv, a->fn, prog);
+            int nargs = static_cast<int>(a->args.size());
+            auto* arg_arr = new int[nargs];
+            for (int j = 0; j < nargs; j++)
+                arg_arr[j] = denote_variant(cenv, a->args[j], prog);
+            return prog.emit(VAppInstr{fn_idx, arg_arr, nargs});
+        },
+        [&](const std::unique_ptr<Fix>& f) -> int {
+            auto captured = collect_captured(cenv, e);
+            std::vector<int> cdvars;
+            std::vector<std::string> ext;
+            for (const auto& [var, dvar] : captured) {
+                ext.push_back(var);
+                cdvars.push_back(dvar);
+            }
+            ext.push_back(f->self_name);
+            for (const auto& p : f->params) ext.push_back(p);
+            int body_idx = denote_variant(cenv_extend_mult(cenv, ext), f->body, prog);
+            int nc = static_cast<int>(cdvars.size());
+            int* cdarr = nc > 0 ? new int[nc] : nullptr;
+            for (int j = 0; j < nc; j++) cdarr[j] = cdvars[j];
+            return prog.emit(VFixInstr{body_idx, cdarr, nc,
+                         static_cast<int>(1 + f->params.size() + cdvars.size())});
+        },
+        [&](const std::unique_ptr<Prim>& p) -> int {
+            int lhs = denote_variant(cenv, p->lhs, prog);
+            int rhs = denote_variant(cenv, p->rhs, prog);
+            return prog.emit(VPrimInstr{p->op, lhs, rhs});
+        },
+        [&](const std::unique_ptr<If>& if_) -> int {
+            int guard = denote_variant(cenv, if_->guard, prog);
+            int thn = denote_variant(cenv, if_->thn, prog);
+            int els = denote_variant(cenv, if_->els, prog);
+            return prog.emit(VIfInstr{guard, thn, els});
+        }
+    }, e);
+}
+
 // ---------- Native ----------
 
 int64_t native_fib(int64_t n) {
@@ -563,8 +674,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::string mode = argv[1];
-    if (mode == "--naive" || mode == "--host" || mode == "--closure" || mode == "--fastest") {
-        if (argc < 3) { printf("Usage: interpreter [--naive|--host|--closure|--fastest] <n>\n"); return 1; }
+    if (mode == "--naive" || mode == "--host" || mode == "--closure" || mode == "--fastest" || mode == "--variant") {
+        if (argc < 3) { printf("Usage: interpreter [--naive|--host|--closure|--fastest|--variant] <n>\n"); return 1; }
         int n = std::atoi(argv[2]);
         if (mode == "--host") {
             printf("%lld\n", (long long)native_fib(n));
@@ -580,6 +691,14 @@ int main(int argc, char* argv[]) {
             auto instr = denote_fastest(cenv_empty, make_app(make_fib_expr(), std::move(args)));
             FStack stack(1024);
             auto result = eval_fastest(instr, stack);
+            printf("%d\n", result.int_val);
+        } else if (mode == "--variant") {
+            std::vector<Expr> args;
+            args.push_back(make_int(n));
+            VProgram prog;
+            int entry = denote_variant(cenv_empty, make_app(make_fib_expr(), std::move(args)), prog);
+            FStack stack(1024);
+            auto result = eval_variant(prog, entry, stack);
             printf("%d\n", result.int_val);
         } else {
             std::vector<Expr> args;
