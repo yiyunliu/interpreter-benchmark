@@ -129,6 +129,81 @@ Value denote(const Env& env, const Expr& e) {
     }, e);
 }
 
+// ---------- Curried interpreter ----------
+
+using FastCompiled = std::function<Value(const Env&)>;
+
+FastCompiled denote_fast(const Expr& e) {
+    return std::visit(overloaded{
+        [&](int n) -> FastCompiled {
+            return [n](const Env&) -> Value { return n; };
+        },
+        [&](const std::unique_ptr<Var>& v) -> FastCompiled {
+            std::string name = v->name;
+            return [name = std::move(name)](const Env& env) -> Value {
+                auto it = env.find(name);
+                if (it == env.end()) throw std::runtime_error("unbound: " + name);
+                return it->second;
+            };
+        },
+        [&](const std::unique_ptr<App>& a) -> FastCompiled {
+            auto fun_clos = denote_fast(a->fn);
+            std::vector<FastCompiled> arg_closs;
+            for (const auto& arg : a->args) arg_closs.push_back(denote_fast(arg));
+            return [fun_clos, arg_closs](const Env& env) -> Value {
+                auto fn_val = fun_clos(env);
+                auto* cl = std::get_if<Closure*>(&fn_val);
+                if (!cl) throw std::runtime_error("apply non-function");
+                std::vector<Value> args;
+                args.reserve(arg_closs.size());
+                for (const auto& c : arg_closs) args.push_back(c(env));
+                return (*cl)->fn(std::move(args));
+            };
+        },
+        [&](const std::unique_ptr<Fix>& f) -> FastCompiled {
+            std::vector<std::string> all_params;
+            all_params.push_back(f->self_name);
+            for (const auto& p : f->params) all_params.push_back(p);
+            auto body_clos = denote_fast(f->body);
+            return [all_params, body_clos](const Env& env) -> Value {
+                auto closure = new Closure();
+                closure->fn = [closure, env, all_params, body_clos](std::vector<Value> vals) -> Value {
+                    Env new_env = env;
+                    new_env[all_params[0]] = closure;
+                    for (size_t i = 0; i < vals.size(); i++)
+                        new_env[all_params[i + 1]] = std::move(vals[i]);
+                    return body_clos(new_env);
+                };
+                return closure;
+            };
+        },
+        [&](const std::unique_ptr<Prim>& p) -> FastCompiled {
+            auto op = p->op;
+            auto lhs_clos = denote_fast(p->lhs);
+            auto rhs_clos = denote_fast(p->rhs);
+            return [op, lhs_clos, rhs_clos](const Env& env) -> Value {
+                auto l = lhs_clos(env);
+                auto r = rhs_clos(env);
+                auto* li = std::get_if<int>(&l);
+                auto* ri = std::get_if<int>(&r);
+                if (!li || !ri) throw std::runtime_error("arith on non-numbers");
+                return apply_binop(op, *li, *ri);
+            };
+        },
+        [&](const std::unique_ptr<If>& i) -> FastCompiled {
+            auto guard_clos = denote_fast(i->guard);
+            auto thn_clos = denote_fast(i->thn);
+            auto els_clos = denote_fast(i->els);
+            return [guard_clos, thn_clos, els_clos](const Env& env) -> Value {
+                auto g = guard_clos(env);
+                auto* gi = std::get_if<int>(&g);
+                if (gi && *gi == 0) return els_clos(env);
+                return thn_clos(env);
+            };
+        }
+    }, e);
+}
+
 // ---------- Stack interpreter ----------
 
 struct Stack {
@@ -291,6 +366,173 @@ Compiled denote_faster(CEnv cenv, const Expr& e) {
     }, e);
 }
 
+// ---------- Defunctionalized stack interpreter ----------
+
+struct FInstr;
+struct FFixClosure;
+
+struct FValue {
+    enum Tag { Int, Closure } tag;
+    int int_val;
+    FFixClosure* closure_val;
+};
+
+struct FFixClosure {
+    FValue* captured_args;
+    int ncaptured;
+    const FInstr* body;
+    int frame_len;
+};
+
+static inline FValue fv_int(int n) { return {FValue::Int, n, nullptr}; }
+static inline FValue fv_closure(FFixClosure* c) { return {FValue::Closure, 0, c}; }
+
+struct FStack {
+    FValue* data;
+    int top;
+    int cap;
+    explicit FStack(int size) : data(new FValue[size]), top(0), cap(size) {}
+    void push(FValue v) {
+        if (top >= cap) throw std::runtime_error("stack overflow");
+        data[top++] = v;
+    }
+    FValue ref(int idx) const { return data[top - idx - 1]; }
+    void pop(int n) { top -= n; }
+};
+
+struct FInstr {
+    enum Tag { Int, Var, Prim, App, Fix, If } tag;
+    int int_val;
+    int dvar;
+    Binop op;
+    const FInstr* lhs;
+    const FInstr* rhs;
+    const FInstr* fn_instr;
+    const FInstr** arg_instrs;
+    int nargs;
+    const FInstr* body_instr;
+    int* captured_dvars;
+    int ncaptured;
+    int frame_len;
+    const FInstr* guard_instr;
+    const FInstr* thn_instr;
+    const FInstr* els_instr;
+};
+
+FValue eval_fastest(const FInstr* instr, FStack& stk) {
+    switch (instr->tag) {
+        case FInstr::Int:
+            return fv_int(instr->int_val);
+        case FInstr::Var:
+            return stk.ref(instr->dvar);
+        case FInstr::Prim: {
+            auto l = eval_fastest(instr->lhs, stk);
+            auto r = eval_fastest(instr->rhs, stk);
+            return fv_int(apply_binop(instr->op, l.int_val, r.int_val));
+        }
+        case FInstr::App: {
+            auto fn_val = eval_fastest(instr->fn_instr, stk);
+            if (fn_val.tag != FValue::Closure) throw std::runtime_error("apply non-function");
+            auto& closure = *fn_val.closure_val;
+            FValue arg_buf[8];
+            FValue* args = instr->nargs <= 8 ? arg_buf : new FValue[instr->nargs];
+            for (int i = 0; i < instr->nargs; i++)
+                args[i] = eval_fastest(instr->arg_instrs[i], stk);
+            for (int i = 0; i < closure.ncaptured; i++)
+                stk.push(closure.captured_args[i]);
+            stk.push(fv_closure(fn_val.closure_val));
+            for (int i = 0; i < instr->nargs; i++)
+                stk.push(args[i]);
+            if (instr->nargs > 8) delete[] args;
+            auto retval = eval_fastest(closure.body, stk);
+            stk.pop(closure.frame_len);
+            return retval;
+        }
+        case FInstr::Fix: {
+            auto* closure = new FFixClosure();
+            closure->ncaptured = instr->ncaptured;
+            closure->captured_args = instr->ncaptured > 0 ? new FValue[instr->ncaptured] : nullptr;
+            for (int i = 0; i < instr->ncaptured; i++)
+                closure->captured_args[i] = stk.ref(instr->captured_dvars[i]);
+            closure->body = instr->body_instr;
+            closure->frame_len = instr->frame_len;
+            return fv_closure(closure);
+        }
+        case FInstr::If: {
+            auto g = eval_fastest(instr->guard_instr, stk);
+            if (g.int_val == 0)
+                return eval_fastest(instr->els_instr, stk);
+            return eval_fastest(instr->thn_instr, stk);
+        }
+    }
+    __builtin_unreachable();
+}
+
+const FInstr* denote_fastest(CEnv cenv, const Expr& e) {
+    return std::visit(overloaded{
+        [&](int n) -> const FInstr* {
+            auto* i = new FInstr{FInstr::Int, n, 0, {}, nullptr, nullptr,
+                                 nullptr, nullptr, 0, nullptr, nullptr, 0, 0,
+                                 nullptr, nullptr, nullptr};
+            return i;
+        },
+        [&](const std::unique_ptr<Var>& v) -> const FInstr* {
+            auto* i = new FInstr{FInstr::Var, 0, cenv(v->name), {}, nullptr, nullptr,
+                                 nullptr, nullptr, 0, nullptr, nullptr, 0, 0,
+                                 nullptr, nullptr, nullptr};
+            return i;
+        },
+        [&](const std::unique_ptr<App>& a) -> const FInstr* {
+            int nargs = static_cast<int>(a->args.size());
+            auto** arg_arr = new const FInstr*[nargs];
+            for (int j = 0; j < nargs; j++)
+                arg_arr[j] = denote_fastest(cenv, a->args[j]);
+            auto* i = new FInstr{FInstr::App, 0, 0, {}, nullptr, nullptr,
+                                 denote_fastest(cenv, a->fn), arg_arr, nargs,
+                                 nullptr, nullptr, 0, 0,
+                                 nullptr, nullptr, nullptr};
+            return i;
+        },
+        [&](const std::unique_ptr<Fix>& f) -> const FInstr* {
+            auto captured = collect_captured(cenv, e);
+            std::vector<int> cdvars;
+            std::vector<std::string> ext;
+            for (const auto& [var, dvar] : captured) {
+                ext.push_back(var);
+                cdvars.push_back(dvar);
+            }
+            ext.push_back(f->self_name);
+            for (const auto& p : f->params) ext.push_back(p);
+            int nc = static_cast<int>(cdvars.size());
+            int* cdarr = nc > 0 ? new int[nc] : nullptr;
+            for (int j = 0; j < nc; j++) cdarr[j] = cdvars[j];
+            auto* i = new FInstr{FInstr::Fix, 0, 0, {}, nullptr, nullptr,
+                                 nullptr, nullptr, 0,
+                                 denote_fastest(cenv_extend_mult(cenv, ext), f->body),
+                                 cdarr, nc,
+                                 static_cast<int>(1 + f->params.size() + cdvars.size()),
+                                 nullptr, nullptr, nullptr};
+            return i;
+        },
+        [&](const std::unique_ptr<Prim>& p) -> const FInstr* {
+            auto* i = new FInstr{FInstr::Prim, 0, 0, p->op,
+                                 denote_fastest(cenv, p->lhs),
+                                 denote_fastest(cenv, p->rhs),
+                                 nullptr, nullptr, 0, nullptr, nullptr, 0, 0,
+                                 nullptr, nullptr, nullptr};
+            return i;
+        },
+        [&](const std::unique_ptr<If>& if_) -> const FInstr* {
+            auto* i = new FInstr{FInstr::If, 0, 0, {}, nullptr, nullptr,
+                                 nullptr, nullptr, 0, nullptr, nullptr, 0, 0,
+                                 denote_fastest(cenv, if_->guard),
+                                 denote_fastest(cenv, if_->thn),
+                                 denote_fastest(cenv, if_->els)};
+            return i;
+        }
+    }, e);
+}
+
 // ---------- Native ----------
 
 int64_t native_fib(int64_t n) {
@@ -321,11 +563,24 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::string mode = argv[1];
-    if (mode == "--naive" || mode == "--host") {
-        if (argc < 3) { printf("Usage: interpreter [--naive|--host] <n>\n"); return 1; }
+    if (mode == "--naive" || mode == "--host" || mode == "--closure" || mode == "--fastest") {
+        if (argc < 3) { printf("Usage: interpreter [--naive|--host|--closure|--fastest] <n>\n"); return 1; }
         int n = std::atoi(argv[2]);
         if (mode == "--host") {
             printf("%lld\n", (long long)native_fib(n));
+        } else if (mode == "--closure") {
+            std::vector<Expr> args;
+            args.push_back(make_int(n));
+            auto compiled = denote_fast(make_app(make_fib_expr(), std::move(args)));
+            auto result = compiled(Env{});
+            printf("%d\n", std::get<int>(result));
+        } else if (mode == "--fastest") {
+            std::vector<Expr> args;
+            args.push_back(make_int(n));
+            auto instr = denote_fastest(cenv_empty, make_app(make_fib_expr(), std::move(args)));
+            FStack stack(1024);
+            auto result = eval_fastest(instr, stack);
+            printf("%d\n", result.int_val);
         } else {
             std::vector<Expr> args;
             args.push_back(make_int(n));

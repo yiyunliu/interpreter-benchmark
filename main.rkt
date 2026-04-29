@@ -278,6 +278,134 @@
     [e (lambda ([_ : Stack]) e)]))
 
 
+;; ---------- Defunctionalized stack interpreter ----------
+
+(struct FClosure ([captured-args : (Vectorof FValue)]
+                  [body : FInstr]
+                  [frame-len : Integer]) #:transparent)
+
+(define-type FValue (U Integer FClosure))
+
+(struct FStack ([data : (Mutable-Vectorof (U FValue #f))]
+                [top : (Boxof Integer)]) #:transparent)
+
+(: make-fstack (-> Integer FStack))
+(define (make-fstack size)
+  (FStack (make-vector size #f) (box 0)))
+
+(: fstack-push! (-> FStack FValue Void))
+(define (fstack-push! stack val)
+  (let* ([data (FStack-data stack)]
+         [btop (FStack-top stack)]
+         [top (unbox btop)]
+         [size (vector-length data)])
+    (cond
+      [(>= top size) (error "stack overflow!")]
+      [else
+       (vector-set! data top val)
+       (set-box! btop (add1 top))])))
+
+(: fstack-ref (-> FStack Integer FValue))
+(define (fstack-ref stack idx)
+  (or (vector-ref (FStack-data stack) (- (unbox (FStack-top stack)) idx 1))
+      (error "broken invariant in fstack")))
+
+(: fstack-pop! (-> FStack Void))
+(define (fstack-pop! stack)
+  (let* ([btop (FStack-top stack)]
+         [top (unbox btop)]
+         [data (FStack-data stack)])
+    (vector-set! data top #f)
+    (set-box! btop (sub1 top))))
+
+(struct FIntInstr ([val : Integer]) #:transparent)
+(struct FVarInstr ([dvar : Natural]) #:transparent)
+(struct FPrimInstr ([op : Binop] [lhs : FInstr] [rhs : FInstr]) #:transparent)
+(struct FAppInstr ([fn : FInstr] [args : (Listof FInstr)]) #:transparent)
+(struct FFixInstr ([body : FInstr] [captured-dvars : (Listof Natural)] [frame-len : Natural]) #:transparent)
+(struct FIfInstr ([guard : FInstr] [thn : FInstr] [els : FInstr]) #:transparent)
+
+(define-type FInstr (U FIntInstr FVarInstr FPrimInstr FAppInstr FFixInstr FIfInstr))
+
+(: apply-fbinop (-> Binop Integer Integer Integer))
+(define (apply-fbinop op l r)
+  (case op
+    ['+ (+ l r)]
+    ['- (- l r)]
+    ['* (* l r)]
+    ['quotient (quotient l r)]
+    ['<= (if (<= l r) 1 0)]))
+
+(: eval-defun (-> FInstr FStack FValue))
+(define (eval-defun instr stk)
+  (cond
+    [(FIntInstr? instr) (FIntInstr-val instr)]
+    [(FVarInstr? instr) (fstack-ref stk (FVarInstr-dvar instr))]
+    [(FPrimInstr? instr)
+     (let ([l (eval-defun (FPrimInstr-lhs instr) stk)]
+           [r (eval-defun (FPrimInstr-rhs instr) stk)])
+       (cond
+         [(and (integer? l) (integer? r))
+          (apply-fbinop (FPrimInstr-op instr) l r)]
+         [else (error "arith on non-numbers")]))]
+    [(FAppInstr? instr)
+     (let ([fn-val (eval-defun (FAppInstr-fn instr) stk)])
+       (cond
+         [(FClosure? fn-val)
+          (let* ([captured (FClosure-captured-args fn-val)]
+                 [body (FClosure-body fn-val)]
+                 [flen (FClosure-frame-len fn-val)]
+                 [args (for/list : (Listof FValue) ([arg (FAppInstr-args instr)])
+                         (eval-defun arg stk))])
+            (for ([val (in-vector captured)])
+              (fstack-push! stk val))
+            (fstack-push! stk fn-val)
+            (for ([val args])
+              (fstack-push! stk val))
+            (define retval (eval-defun body stk))
+            (for ([_ (in-range flen)])
+              (fstack-pop! stk))
+            retval)]
+         [else (error "apply non-function")]))]
+    [(FFixInstr? instr)
+     (let ([captured-args (for/vector : (Vectorof FValue)
+                                    ([dvar (FFixInstr-captured-dvars instr)])
+                            (fstack-ref stk dvar))])
+       (FClosure captured-args
+                 (FFixInstr-body instr)
+                 (FFixInstr-frame-len instr)))]
+    [(FIfInstr? instr)
+     (let ([guard (eval-defun (FIfInstr-guard instr) stk)])
+       (if (and (integer? guard) (zero? guard))
+           (eval-defun (FIfInstr-els instr) stk)
+           (eval-defun (FIfInstr-thn instr) stk)))]))
+
+(: denote-defun (-> CEnv Expr FInstr))
+(define (denote-defun cenv e)
+  (cond
+    [(Var? e) (FVarInstr (cenv (Var-val e)))]
+    [(App? e) (FAppInstr (denote-defun cenv (App-fun e))
+                          (for/list : (Listof FInstr) ([arg (App-args e)])
+                            (denote-defun cenv arg)))]
+    [(Fix? e) (let* ([params (Fix-params e)]
+                     [body (Fix-body e)]
+                     [captured (collect-captured cenv e)]
+                     [captured-vars (for/list : (Listof Symbol) ([sd captured]) (car sd))]
+                     [captured-dvars (for/list : (Listof Natural) ([sd captured]) (cdr sd))]
+                     [body-instr (denote-defun
+                                   (cenv-extend-mult cenv (append captured-vars params))
+                                   body)]
+                     [len (+ (length params) (length captured-dvars))])
+                (FFixInstr body-instr captured-dvars len))]
+    [(Prim? e) (FPrimInstr (Prim-op e)
+                            (denote-defun cenv (Prim-lhs e))
+                            (denote-defun cenv (Prim-rhs e)))]
+    [(If? e) (FIfInstr (denote-defun cenv (If-guard e))
+                        (denote-defun cenv (If-thn e))
+                        (denote-defun cenv (If-els e)))]
+    [else (FIntInstr e)]))
+
+
 (module+ main
   (: fib-expr Expr)
   (define fib-expr
@@ -310,5 +438,9 @@
              (time (compiled (hash)))))
   (println "----------------debruijn--------------")
   (println (time (let ([compiled (denote-faster cenv-empty (App fib-expr '(30)))]
-                 [stack (make-stack 1024)])
-                   (compiled stack)))))
+                  [stack (make-stack 1024)])
+                    (compiled stack))))
+  (println "----------------defun-----------------")
+  (println (time (let ([instr (denote-defun cenv-empty (App fib-expr '(30)))]
+                  [stack (make-fstack 1024)])
+                    (eval-defun instr stack)))))
